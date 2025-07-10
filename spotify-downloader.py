@@ -10,473 +10,379 @@ import threading
 import time
 from dataclasses import dataclass
 import sys
+import queue
 
+# Utility to sanitize filenames
+def sanitize_filename(name: str) -> str:
+    return re.sub(r'[<>:"/\\|?*]', '_', name).strip()
 
 @dataclass
 class DownloadProgress:
-    """Classe pour suivre la progression du téléchargement"""
     current_item: str = ""
     total_items: int = 0
     completed_items: int = 0
+    skipped_items: int = 0
     current_track: str = ""
     failed_items: List[str] = None
-    # Progression du titre en cours
     current_track_progress: float = 0.0
     current_track_status: str = ""
-    
+
     def __post_init__(self):
         if self.failed_items is None:
             self.failed_items = []
-    
-    def get_progress_percentage(self) -> float:
-        if self.total_items == 0:
-            return 0
-        return (self.completed_items / self.total_items) * 100
-    
+
     def get_global_progress_bar(self, width: int = 40) -> str:
-        """Génère une barre de progression globale"""
-        filled_width = int(width * self.completed_items / max(self.total_items, 1))
-        bar = '█' * filled_width + '░' * (width - filled_width)
-        return f"[{bar}] {self.completed_items}/{self.total_items} ({self.get_progress_percentage():.1f}%)"
-    
+        pct = (self.completed_items / self.total_items * 100) if self.total_items else 0
+        filled = int(width * self.completed_items / max(self.total_items,1))
+        bar = '█'*filled + '░'*(width-filled)
+        return f"[{bar}] {self.completed_items}/{self.total_items} ({pct:.1f}%)"
+
     def get_track_progress_bar(self, width: int = 30) -> str:
-        """Génère une barre de progression pour le titre en cours"""
-        filled_width = int(width * self.current_track_progress / 100)
-        bar = '█' * filled_width + '░' * (width - filled_width)
+        filled = int(width * self.current_track_progress / 100)
+        bar = '█'*filled + '░'*(width-filled)
         return f"[{bar}] {self.current_track_progress:.1f}%"
 
-
 class SpotifyDownloader:
-    """Classe pour télécharger de la musique depuis Spotify"""
-    
     def __init__(self):
         load_dotenv()
         self.script_directory = Path(__file__).parent
-        self.music_directory = self.script_directory / "Music"
+        self.music_directory = self.script_directory / 'Music'
         self.music_directory.mkdir(exist_ok=True)
         self.sp = self._init_spotify_client()
         self.progress = DownloadProgress()
-        self._stop_progress_display = False
-        self._progress_lock = threading.Lock()
-    
+        self._stop_flag = False
+        self._lock = threading.Lock()
+
     def _init_spotify_client(self) -> spotipy.Spotify:
-        """Initialise le client Spotify"""
-        client_id = os.environ.get('SPOTIFY_CLIENT_ID')
-        client_secret = os.environ.get('SPOTIFY_CLIENT_SECRET')
-        
-        if not client_id or not client_secret:
-            raise ValueError("Les variables d'environnement SPOTIFY_CLIENT_ID et SPOTIFY_CLIENT_SECRET sont requises")
-        
-        auth_manager = SpotifyClientCredentials(client_id=client_id, client_secret=client_secret)
-        return spotipy.Spotify(auth_manager=auth_manager)
-    
+        cid = os.getenv('SPOTIFY_CLIENT_ID')
+        cs = os.getenv('SPOTIFY_CLIENT_SECRET')
+        if not cid or not cs:
+            raise ValueError('SPOTIFY_CLIENT_ID et SPOTIFY_CLIENT_SECRET requis')
+        auth = SpotifyClientCredentials(client_id=cid, client_secret=cs)
+        return spotipy.Spotify(auth_manager=auth)
+
     def _display_progress(self):
-        """Affiche la progression en temps réel avec double affichage"""
-        lines_printed = 0
-        
-        while not self._stop_progress_display:
-            with self._progress_lock:
-                # Effacer les lignes précédentes
-                if lines_printed > 0:
-                    for _ in range(lines_printed):
-                        print("\033[1A\033[K", end="")  # Remonter et effacer la ligne
-                
-                lines_printed = 0
-                
-                # Affichage global
-                global_bar = self.progress.get_global_progress_bar()
-                print(f"🌍 Global: {global_bar}")
-                lines_printed += 1
-                
-                # Affichage du titre en cours
+        lines = 0
+        while not self._stop_flag:
+            with self._lock:
+                if lines > 0:
+                    for _ in range(lines): print("\033[1A\033[K", end='')
+                lines = 0
+                print(f"🌍 Global: {self.progress.get_global_progress_bar()}")
+                lines += 1
+                if self.progress.skipped_items > 0:
+                    print(f"⏭️ Ignorés: {self.progress.skipped_items}")
+                    lines += 1
                 if self.progress.current_track:
-                    track_bar = self.progress.get_track_progress_bar()
-                    track_name = self.progress.current_track[:50] + "..." if len(self.progress.current_track) > 50 else self.progress.current_track
-                    print(f"🎵 Titre:  {track_bar} {track_name}")
-                    lines_printed += 1
-                
-                # Affichage du statut
+                    print(f"🎵 Titre:  {self.progress.get_track_progress_bar()} {self.progress.current_track}")
+                    lines += 1
                 if self.progress.current_track_status:
                     print(f"📊 Status: {self.progress.current_track_status}")
-                    lines_printed += 1
-                
-                # Forcer l'affichage
+                    lines += 1
                 sys.stdout.flush()
-            
-            time.sleep(0.3)  # Réduire la fréquence de mise à jour
-    
-    def _start_progress_display(self):
-        """Démarre l'affichage de la progression dans un thread séparé"""
-        self._stop_progress_display = False
-        progress_thread = threading.Thread(target=self._display_progress, daemon=True)
-        progress_thread.start()
-        return progress_thread
-    
-    def _stop_progress_display_func(self):
-        """Arrête l'affichage de la progression"""
-        self._stop_progress_display = True
-        time.sleep(0.5)  # Attendre que le thread se termine
-        print("\n")  # Nouvelle ligne après la barre de progression
-    
-    def _update_progress(self, track_name: str = None, progress: float = None, status: str = None):
-        """Met à jour la progression de manière thread-safe"""
-        with self._progress_lock:
-            if track_name is not None:
-                self.progress.current_track = track_name
-            if progress is not None:
-                self.progress.current_track_progress = progress
-            if status is not None:
-                self.progress.current_track_status = status
-    
-    def _sanitize_filename(self, filename: str) -> str:
-        """Nettoie le nom de fichier pour éviter les caractères invalides"""
-        # Remplace les caractères problématiques par des underscores
-        return re.sub(r'[<>:"/\\|?*]', '_', filename).strip()
-    
-    def _extract_spotify_info(self, url: str) -> Tuple[str, str]:
-        """Extrait le type et l'ID depuis une URL Spotify"""
+            time.sleep(0.3)
+
+    def _start_progress(self) -> threading.Thread:
+        self._stop_flag = False
+        t = threading.Thread(target=self._display_progress, daemon=True)
+        t.start()
+        return t
+
+    def _stop_progress(self):
+        self._stop_flag = True
+        time.sleep(0.5)
+        print()
+
+    def _update_progress(self, track=None, prog=None, status=None):
+        with self._lock:
+            if track is not None: self.progress.current_track = track
+            if prog is not None: self.progress.current_track_progress = prog
+            if status is not None: self.progress.current_track_status = status
+
+    def _extract_spotify_info(self, url: str) -> Tuple[str,str]:
         if 'spotify.com' not in url:
-            raise ValueError("URL Spotify invalide")
-        
-        # Pattern plus robuste pour extraire le type et l'ID
+            raise ValueError('URL Spotify invalide')
         pattern = r'spotify\.com/([^/]+)/([^/?]+)'
-        match = re.search(pattern, url)
-        
-        if not match:
-            raise ValueError("Impossible d'extraire les informations de l'URL")
-        
-        url_type, item_id = match.groups()
-        
-        if url_type not in ['album', 'playlist']:
-            raise ValueError("Le type doit être 'album' ou 'playlist'")
-        
-        return url_type, item_id
-    
-    def _get_album_info(self, album_id: str) -> List[Tuple[str, str, str, str]]:
-        """Récupère les informations d'un album"""
+        m = re.search(pattern, url)
+        if not m: raise ValueError("Impossible d'extraire info URL")
+        t,id_ = m.groups()
+        if t not in ['album','playlist']: raise ValueError('Le type doit être album ou playlist')
+        return t,id_
+
+    def _get_playlist_info(self, playlist_id: str) -> List[Tuple[str,str,str,str]]:
+        plist = self.sp.playlist(playlist_id)
+        total = plist['tracks']['total']
+        items=[]; offset=0
+        while offset < total:
+            batch = self.sp.playlist_tracks(playlist_id, offset=offset, limit=100,
+                                            fields='items(track(id,name,artists,album)),total')
+            for it in batch['items']:
+                tr = it['track']
+                if not tr or not tr.get('id'): continue
+                artist = sanitize_filename(tr['artists'][0]['name'])
+                album = sanitize_filename(tr['album']['name'])
+                items.append((artist,album,tr['id'],'playlist'))
+            offset += 100
+            time.sleep(0.1)
+        return items
+
+    def _get_album_info(self, album_id: str) -> List[Tuple[str,str,str,str]]:
+        album = self.sp.album(album_id)
+        artist = sanitize_filename(album['artists'][0]['name'])
+        name = sanitize_filename(album['name'])
+        total = album['tracks']['total']
+        items=[]; offset=0
+        while offset < total:
+            batch = self.sp.album_tracks(album_id, offset=offset, limit=50)
+            for tr in batch['items']:
+                if not tr.get('id'): continue
+                items.append((artist,name,tr['id'],'album'))
+            offset += 50
+            time.sleep(0.1)
+        return items
+
+    def parse_spotify_item(self, url: str) -> List[Tuple[str,str,str,str]]:
+        t,id_ = self._extract_spotify_info(url)
+        return self._get_album_info(id_) if t=='album' else self._get_playlist_info(id_)
+
+    def _file_exists(self, artist: str, album: str, track_id: str) -> bool:
+        """
+        Vérifie si un fichier de musique existe déjà.
+        Recherche dans le dossier artist/album/ plusieurs formats possibles.
+        """
         try:
-            album = self.sp.album(album_id)
-            artist = album['artists'][0]['name']
-            album_name = album['name']
-            return [(self._sanitize_filename(artist), self._sanitize_filename(album_name), album_id, 'album')]
-        except Exception as e:
-            print(f"Erreur lors de la récupération de l'album {album_id}: {e}")
-            return []
-    
-    def _get_playlist_info(self, playlist_id: str) -> List[Tuple[str, str, str, str]]:
-        """Récupère les informations d'une playlist avec pagination complète"""
-        try:
-            playlist = self.sp.playlist(playlist_id)
-            playlist_name = playlist['name']
-            total_tracks = playlist['tracks']['total']
+            # Obtenir le titre de la piste
+            track_info = self.sp.track(track_id)
+            title = sanitize_filename(track_info['name'])
             
-            print(f"📋 Récupération de la playlist '{playlist_name}' ({total_tracks} titres)...")
+            # Chemins à vérifier
+            artist_dir = self.music_directory / artist
+            album_dir = artist_dir / album
             
-            items = []
-            offset = 0
-            limit = 100  # Maximum autorisé par Spotify
+            if not album_dir.exists():
+                return False
             
-            while offset < total_tracks:
-                # Récupérer les tracks par batch de 100
-                tracks_batch = self.sp.playlist_tracks(
-                    playlist_id, 
-                    offset=offset, 
-                    limit=limit,
-                    fields='items(track(id,name,artists,album)),total'
-                )
-                
-                print(f"📥 Récupération des titres {offset + 1} à {min(offset + limit, total_tracks)}...")
-                
-                for track_item in tracks_batch['items']:
-                    track = track_item.get('track')
-                    if track and track.get('id') and track.get('artists'):
-                        artist = self._sanitize_filename(track['artists'][0]['name'])
-                        album_name = self._sanitize_filename(track['album']['name'])
-                        track_id = track['id']
-                        items.append((artist, album_name, track_id, 'playlist'))
-                
-                offset += limit
-                
-                # Petite pause pour éviter de surcharger l'API
-                time.sleep(0.1)
+            # Formats de fichiers possibles
+            possible_filenames = [
+                f"{title}.mp3",
+                f"{artist} - {title}.mp3",
+                f"{sanitize_filename(track_info['name'])}.mp3",
+                f"{artist} - {sanitize_filename(track_info['name'])}.mp3"
+            ]
             
-            print(f"✅ {len(items)} titres récupérés depuis la playlist '{playlist_name}'")
-            return items
+            # Vérifier tous les fichiers MP3 dans le dossier
+            for mp3_file in album_dir.glob("*.mp3"):
+                filename = mp3_file.name
+                # Vérification exacte
+                if filename in possible_filenames:
+                    return True
+                # Vérification approximative (enlever caractères spéciaux)
+                clean_filename = re.sub(r'[^\w\s-]', '', filename.lower())
+                clean_title = re.sub(r'[^\w\s-]', '', title.lower())
+                if clean_title in clean_filename:
+                    return True
             
-        except Exception as e:
-            print(f"❌ Erreur lors de la récupération de la playlist {playlist_id}: {e}")
-            return []
-    
-    def _get_album_tracks_info(self, album_id: str) -> List[Tuple[str, str, str, str]]:
-        """Récupère tous les tracks d'un album avec pagination"""
-        try:
-            album = self.sp.album(album_id)
-            artist = album['artists'][0]['name']
-            album_name = album['name']
-            total_tracks = album['tracks']['total']
-            
-            print(f"💿 Récupération de l'album '{album_name}' par {artist} ({total_tracks} titres)...")
-            
-            items = []
-            offset = 0
-            limit = 50  # Maximum pour les tracks d'album
-            
-            while offset < total_tracks:
-                # Récupérer les tracks par batch
-                tracks_batch = self.sp.album_tracks(
-                    album_id,
-                    offset=offset,
-                    limit=limit
-                )
-                
-                for track in tracks_batch['items']:
-                    if track.get('id'):
-                        items.append((
-                            self._sanitize_filename(artist),
-                            self._sanitize_filename(album_name),
-                            track['id'],
-                            'track'
-                        ))
-                
-                offset += limit
-                
-                # Petite pause pour éviter de surcharger l'API
-                time.sleep(0.1)
-            
-            print(f"✅ {len(items)} titres récupérés depuis l'album '{album_name}'")
-            return items
+            return False
             
         except Exception as e:
-            print(f"❌ Erreur lors de la récupération de l'album {album_id}: {e}")
-            return []
-    
-    def parse_spotify_item(self, url: str) -> List[Tuple[str, str, str, str]]:
-        """Parse une URL Spotify et retourne les informations des éléments"""
+            print(f"Erreur lors de la vérification du fichier: {e}")
+            return False
+
+    def _read_output(self, pipe, output_queue):
+        """Thread pour lire la sortie du processus en temps réel"""
         try:
-            url_type, item_id = self._extract_spotify_info(url)
-            
-            if url_type == "album":
-                return self._get_album_tracks_info(item_id)
-            elif url_type == "playlist":
-                return self._get_playlist_info(item_id)
-            
-        except Exception as e:
-            print(f"❌ Erreur lors du parsing de l'URL {url}: {e}")
-            return []
-    
-    def _run_spotdl_command(self, command: List[str], cwd: Path, item_name: str) -> bool:
-        """Exécute une commande spotdl de manière sécurisée avec suivi détaillé"""
+            while True:
+                line = pipe.readline()
+                if not line:
+                    break
+                output_queue.put(line.strip())
+        except Exception:
+            pass
+        finally:
+            pipe.close()
+
+    def _download_spotdl(self, url: str, cwd: Path, display: str) -> bool:
+        """Télécharge une piste avec spotdl et affiche la progression en temps réel"""
+        cmd = ['spotdl', 'download', url, '--format', 'mp3', '--bitrate', '320k', '--overwrite', 'skip']
+        self._update_progress(track=display, prog=0, status='🔄 Démarrage')
+        
         try:
-            # Initialiser la progression du titre
-            self._update_progress(
-                track_name=item_name,
-                progress=0.0,
-                status="🔄 Démarrage..."
-            )
-            
-            # Créer le processus
-            process = subprocess.Popen(
-                command,
-                cwd=cwd,
-                stdout=subprocess.PIPE,
-                stderr=subprocess.PIPE,
-                text=True,
+            # Démarrer le processus
+            proc = subprocess.Popen(
+                cmd, 
+                cwd=cwd, 
+                stdout=subprocess.PIPE, 
+                stderr=subprocess.STDOUT,  # Rediriger stderr vers stdout
+                text=True, 
                 bufsize=1,
                 universal_newlines=True
             )
             
-            # Suivre la sortie en temps réel
-            output_lines = []
-            error_lines = []
+            # Queue pour recevoir les lignes de sortie
+            output_queue = queue.Queue()
             
-            while True:
-                output = process.stdout.readline()
-                if output == '' and process.poll() is not None:
-                    break
-                    
-                if output:
-                    output_clean = output.strip()
-                    output_lines.append(output_clean)
-                    
-                    # Analyser la sortie de spotdl pour extraire la progression
-                    if "Searching" in output_clean or "searching" in output_clean.lower():
-                        self._update_progress(progress=10.0, status="🔍 Recherche...")
-                    elif "Found" in output_clean or "found" in output_clean.lower():
-                        self._update_progress(progress=20.0, status="✅ Trouvé")
-                        # Extraire le nom du track si disponible
-                        if ":" in output_clean:
-                            track_info = output_clean.split(":", 1)[-1].strip()
-                            if track_info and len(track_info) > 3:
-                                clean_track = track_info[:60] + "..." if len(track_info) > 60 else track_info
-                                self._update_progress(track_name=clean_track)
-                    elif "Downloading" in output_clean or "downloading" in output_clean.lower():
-                        self._update_progress(progress=40.0, status="📥 Téléchargement...")
-                    elif "Converting" in output_clean or "converting" in output_clean.lower():
-                        self._update_progress(progress=70.0, status="🔄 Conversion...")
-                    elif "Applying" in output_clean or "metadata" in output_clean.lower():
-                        self._update_progress(progress=85.0, status="🏷️ Métadonnées...")
-                    elif "Downloaded" in output_clean or "downloaded" in output_clean.lower():
-                        self._update_progress(progress=100.0, status="✅ Terminé")
-                    elif "%" in output_clean:
-                        # Essayer d'extraire un pourcentage si disponible
-                        try:
-                            percent_match = re.search(r'(\d+(?:\.\d+)?)%', output_clean)
-                            if percent_match:
-                                percent = float(percent_match.group(1))
-                                # Ajuster la progression en fonction de l'étape actuelle
-                                adjusted_progress = min(95.0, max(self.progress.current_track_progress, 30.0 + percent * 0.6))
-                                self._update_progress(progress=adjusted_progress)
-                        except:
-                            pass
-                    elif "error" in output_clean.lower() or "failed" in output_clean.lower():
-                        self._update_progress(progress=0.0, status="❌ Erreur détectée")
+            # Thread pour lire la sortie
+            reader_thread = threading.Thread(
+                target=self._read_output, 
+                args=(proc.stdout, output_queue),
+                daemon=True
+            )
+            reader_thread.start()
             
-            # Lire les erreurs
-            stderr_output = process.stderr.read()
-            if stderr_output:
-                error_lines.append(stderr_output.strip())
+            last_progress = 0
+            progress_patterns = [
+                r'(\d+(?:\.\d+)?)%',  # Format standard: 45.2%
+                r'(\d+)/\d+\s*\((\d+(?:\.\d+)?)%\)',  # Format avec ratio: 45/100 (45%)
+                r'Downloaded\s+(\d+(?:\.\d+)?)%',  # Format avec "Downloaded"
+                r'Progress:\s*(\d+(?:\.\d+)?)%',  # Format avec "Progress:"
+            ]
+            
+            # Simulation de progression basée sur le temps (fallback)
+            start_time = time.time()
+            estimated_duration = 30  # Estimation de 30 secondes par défaut
+            
+            while proc.poll() is None:
+                try:
+                    # Essayer de lire une ligne avec timeout
+                    line = output_queue.get(timeout=0.5)
+                    
+                    # Chercher un pourcentage dans la ligne
+                    progress_found = False
+                    for pattern in progress_patterns:
+                        match = re.search(pattern, line)
+                        if match:
+                            try:
+                                # Prendre le premier groupe qui contient un pourcentage
+                                if len(match.groups()) > 1:
+                                    progress = float(match.group(2))  # Deuxième groupe pour les formats avec ratio
+                                else:
+                                    progress = float(match.group(1))  # Premier groupe pour les autres
+                                
+                                if 0 <= progress <= 100:
+                                    last_progress = progress
+                                    self._update_progress(prog=progress, status='📥 Téléchargement')
+                                    progress_found = True
+                                    break
+                            except (ValueError, IndexError):
+                                continue
+                    
+                    # Analyser d'autres indicateurs de statut
+                    if not progress_found:
+                        line_lower = line.lower()
+                        if any(word in line_lower for word in ['downloading', 'téléchargement', 'download']):
+                            self._update_progress(status='📥 Téléchargement')
+                        elif any(word in line_lower for word in ['converting', 'conversion']):
+                            self._update_progress(status='🔄 Conversion')
+                        elif any(word in line_lower for word in ['searching', 'recherche']):
+                            self._update_progress(status='🔍 Recherche')
+                
+                except queue.Empty:
+                    # Pas de nouvelle ligne, utiliser progression estimée
+                    elapsed = time.time() - start_time
+                    estimated_progress = min(95, (elapsed / estimated_duration) * 100)
+                    if estimated_progress > last_progress:
+                        last_progress = estimated_progress
+                        self._update_progress(prog=last_progress, status='📥 Téléchargement')
+                
+                time.sleep(0.1)
             
             # Attendre la fin du processus
-            return_code = process.wait()
+            rc = proc.wait()
             
-            if return_code == 0:
-                self._update_progress(progress=100.0, status="✅ Succès")
-                time.sleep(0.5)  # Laisser le temps de voir le succès
-                return True
-            else:
-                error_msg = "Erreur inconnue"
-                if error_lines:
-                    error_msg = error_lines[0][:60]
-                elif output_lines:
-                    # Chercher des indices d'erreur dans les dernières lignes
-                    for line in reversed(output_lines[-5:]):
-                        if "error" in line.lower() or "failed" in line.lower():
-                            error_msg = line[:60]
-                            break
-                
-                self._update_progress(progress=0.0, status=f"❌ {error_msg}")
-                time.sleep(1)  # Laisser le temps de voir l'erreur
-                return False
-                
+            # Marquer comme terminé
+            success = rc == 0
+            final_progress = 100 if success else last_progress
+            status = '✅ Succès' if success else '❌ Échec'
+            
+            self._update_progress(prog=final_progress, status=status)
+            return success
+            
         except Exception as e:
-            self._update_progress(progress=0.0, status=f"❌ Exception: {str(e)[:40]}")
-            time.sleep(1)
+            self._update_progress(prog=0, status=f'❌ Erreur: {str(e)[:20]}')
             return False
-    
-    def download_item(self, artist: str, album_name: str, item_id: str, url_type: str) -> bool:
-        """Télécharge un élément (album ou track) avec métadonnées complètes"""
-        # Créer les dossiers
-        artist_folder = self.music_directory / artist
-        artist_folder.mkdir(exist_ok=True)
+
+    def download_item(self, artist: str, album: str, track_id: str, url_type: str) -> bool:
+        artist_dir = self.music_directory / artist
+        artist_dir.mkdir(exist_ok=True)
+        album_dir = artist_dir / album
+        album_dir.mkdir(exist_ok=True)
+
+        # Vérifier si le fichier existe déjà
+        if self._file_exists(artist, album, track_id):
+            try:
+                track_info = self.sp.track(track_id)
+                title = sanitize_filename(track_info['name'])
+                self._update_progress(track=f'{artist} - {title}', prog=100, status='⏭️ Déjà téléchargé')
+                time.sleep(0.3)  # Délai pour voir le message
+                with self._lock:
+                    self.progress.completed_items += 1
+                    self.progress.skipped_items += 1
+                return True
+            except Exception as e:
+                print(f'Erreur lors de la récupération des infos de la piste: {e}')
+
+        # Get track title pour le téléchargement
+        try:
+            title_raw = self.sp.track(track_id)['name']
+        except:
+            title_raw = track_id
+        title = sanitize_filename(title_raw)
+
+        # Download
+        url = f'https://open.spotify.com/track/{track_id}'
+        ok = self._download_spotdl(url, album_dir, f'{artist} - {title}')
         
-        album_folder = artist_folder / album_name
-        album_folder.mkdir(exist_ok=True)
-        
-        # Construire la commande spotdl avec options pour métadonnées
-        spotify_url = f"https://open.spotify.com/track/{item_id}"
-        
-        # Commande avec options pour métadonnées complètes
-        command = [
-            "spotdl", 
-            "download",
-            spotify_url,
-            "--format", "mp3",  # Format audio
-            "--bitrate", "320k",  # Qualité audio (avec 'k')
-            "--overwrite", "skip"  # Ne pas re-télécharger les fichiers existants
-        ]
-        
-        # Nom d'affichage pour la progression
-        display_name = f"{artist} - {album_name}"
-        success = self._run_spotdl_command(command, album_folder, display_name)
-        
-        # Mettre à jour les compteurs globaux
-        with self._progress_lock:
+        with self._lock:
             self.progress.completed_items += 1
-            if not success:
-                self.progress.failed_items.append(display_name)
+            if not ok: 
+                self.progress.failed_items.append(f'{artist} - {title}')
         
-        # Petite pause entre les téléchargements
-        time.sleep(0.2)
-        
-        return success
-    
-    def process_urls_file(self, file_path: Optional[str] = None) -> None:
-        """Traite un fichier contenant des URLs Spotify"""
-        if file_path is None:
-            file_path = self.script_directory / 'urls.txt'
-        else:
-            file_path = Path(file_path)
-        
-        if not file_path.exists():
-            print(f"❌ Le fichier {file_path} n'existe pas")
+        time.sleep(0.5)  # Pause pour voir le résultat final
+        return ok
+
+    def process_urls_file(self, filepath: Optional[str]=None):
+        path = Path(filepath) if filepath else self.script_directory/'urls.txt'
+        if not path.exists(): 
+            print(f'❌ {path} introuvable')
             return
+            
+        urls = [l.strip() for l in path.read_text(encoding='utf-8').splitlines() if l.strip()]
+        all_items=[]
+        
+        print("🔍 Analyse des URLs...")
+        for u in urls:
+            print(f'   Analyse: {u}')
+            all_items += self.parse_spotify_item(u)
+            
+        # Remove duplicates
+        seen=set(); items=[]
+        for a,alb,i,t in all_items:
+            if (a,alb,i) not in seen:
+                seen.add((a,alb,i)); items.append((a,alb,i,t))
+                
+        print(f"📊 {len(items)} pistes uniques trouvées")
+        
+        self.progress.total_items = len(items)
+        thread = self._start_progress()
         
         try:
-            with open(file_path, 'r', encoding='utf-8') as file:
-                urls = [line.strip() for line in file if line.strip()]
+            for a,alb,i,t in items:
+                self.download_item(a,alb,i,t)
+        finally:
+            self._stop_progress()
             
-            print(f"📋 Traitement de {len(urls)} URL(s)...")
-            
-            # Compter le nombre total d'items à télécharger
-            all_items = []
-            for url in urls:
-                print(f"🔍 Analyse de l'URL: {url}")
-                items = self.parse_spotify_item(url)
-                all_items.extend(items)
-            
-            print(f"📊 Total des titres trouvés: {len(all_items)}")
-            
-            # Éviter les doublons de tracks
-            seen_tracks = set()
-            unique_items = []
-            
-            for artist, album_name, item_id, url_type in all_items:
-                track_key = (artist, album_name, item_id)
-                if track_key not in seen_tracks:
-                    seen_tracks.add(track_key)
-                    unique_items.append((artist, album_name, item_id, url_type))
-            
-            print(f"📊 Titres uniques à télécharger: {len(unique_items)}")
-            
-            # Initialiser la progression
-            self.progress.total_items = len(unique_items)
-            self.progress.completed_items = 0
-            
-            # Démarrer l'affichage de progression
-            progress_thread = self._start_progress_display()
-            
-            try:
-                # Traiter chaque item
-                for artist, album_name, item_id, url_type in unique_items:
-                    success = self.download_item(artist, album_name, item_id, url_type)
-                    if not success:
-                        print(f"\n⚠️ Échec du téléchargement pour {artist} - {album_name}")
-            finally:
-                # Arrêter l'affichage de progression
-                self._stop_progress_display_func()
-            
-            # Résumé final
-            print(f"\n✅ Téléchargement terminé !")
-            print(f"📊 {self.progress.completed_items - len(self.progress.failed_items)}/{self.progress.total_items} réussis")
-            
-            if self.progress.failed_items:
-                print(f"❌ {len(self.progress.failed_items)} échecs:")
-                for failed_item in self.progress.failed_items:
-                    print(f"   - {failed_item}")
-            
-        except Exception as e:
-            self._stop_progress_display_func()
-            print(f"❌ Erreur lors du traitement du fichier: {e}")
+        # Summary
+        successful = self.progress.completed_items - len(self.progress.failed_items)
+        print(f"\n📈 RÉSUMÉ:")
+        print(f"✅ {successful}/{self.progress.total_items} téléchargements réussis")
+        print(f"⏭️ {self.progress.skipped_items} fichiers déjà présents")
+        if self.progress.failed_items:
+            print(f'❌ {len(self.progress.failed_items)} échecs:')
+            for f in self.progress.failed_items: 
+                print(f'   - {f}')
 
-
-def main():
-    """Fonction principale"""
+if __name__=='__main__':
     try:
-        downloader = SpotifyDownloader()
-        downloader.process_urls_file()
+        SpotifyDownloader().process_urls_file()
     except Exception as e:
-        print(f"❌ Erreur fatale: {e}")
-
-
-if __name__ == "__main__":
-    main()
+        print(f'❌ Erreur fatale: {e}')
